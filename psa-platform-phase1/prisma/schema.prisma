@@ -1,0 +1,338 @@
+// ============================================================================
+// PSA SaaS Platform — Database Schema
+// Multi-tenant. Every business record carries a tenantId and every query
+// in the app MUST filter by it (see src/lib/tenant.ts for the guard helper).
+// Money is stored in integer minor units (e.g. cents) to avoid float errors.
+// ============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ----------------------------------------------------------------------------
+// Tenancy & Identity
+// ----------------------------------------------------------------------------
+
+model Tenant {
+  id              String   @id @default(cuid())
+  name            String
+  slug            String   @unique // used in subdomain or /t/[slug] routing
+  defaultLocale   String   @default("en") // e.g. "en", "fr"
+  defaultCurrency String   @default("USD") // ISO 4217
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  users          User[]
+  clients        Client[]
+  projects       Project[]
+  invoices       Invoice[]
+  expenses       Expense[]
+  timeEntries    TimeEntry[]
+  estimates      Estimate[]
+  expenseCategories ExpenseCategory[]
+
+  @@map("tenants")
+}
+
+enum Role {
+  TENANT_ADMIN     // full control of the tenant account, billing, users
+  PROJECT_MANAGER  // creates/manages projects, estimates, approves time
+  TEAM_USER        // logs time, works on assigned tasks
+  CLIENT           // external, portal-only access scoped to their own projects
+}
+
+model User {
+  id           String   @id @default(cuid())
+  tenantId     String
+  tenant       Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  email        String
+  passwordHash String
+  name         String
+  role         Role
+  locale       String   @default("en")
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  // Only set when role == CLIENT: links this login to a Client record
+  clientId     String?
+  client       Client?  @relation(fields: [clientId], references: [id])
+
+  timeEntries      TimeEntry[]
+  projectsManaged  Project[]        @relation("ProjectManager")
+  changeRequestsMade ChangeRequest[] @relation("ChangeRequestedBy")
+  expenses         Expense[]
+
+  @@unique([tenantId, email]) // email unique per tenant, not globally
+  @@index([tenantId])
+  @@map("users")
+}
+
+// ----------------------------------------------------------------------------
+// Clients (the tenant's own customers — who get portal access)
+// ----------------------------------------------------------------------------
+
+model Client {
+  id        String   @id @default(cuid())
+  tenantId  String
+  tenant    Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  name      String
+  company   String?
+  email     String
+  phone     String?
+  currency  String   @default("USD")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  portalUsers User[]
+  projects    Project[]
+  invoices    Invoice[]
+
+  @@index([tenantId])
+  @@map("clients")
+}
+
+// ----------------------------------------------------------------------------
+// Projects, Tasks, Estimates, Change Requests
+// ----------------------------------------------------------------------------
+
+enum ProjectStatus {
+  DRAFT
+  ACTIVE
+  ON_HOLD
+  COMPLETED
+  CANCELLED
+}
+
+model Project {
+  id          String        @id @default(cuid())
+  tenantId    String
+  tenant      Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  clientId    String
+  client      Client        @relation(fields: [clientId], references: [id])
+  name        String
+  description String?
+  status      ProjectStatus @default(DRAFT)
+  currency    String        @default("USD")
+  managerId   String?
+  manager     User?         @relation("ProjectManager", fields: [managerId], references: [id])
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  tasks          Task[]
+  estimates      Estimate[]
+  timeEntries    TimeEntry[]
+  changeRequests ChangeRequest[]
+  invoices       Invoice[]
+  expenses       Expense[]
+
+  @@index([tenantId])
+  @@index([clientId])
+  @@map("projects")
+}
+
+enum TaskStatus {
+  TODO
+  IN_PROGRESS
+  DONE
+}
+
+model Task {
+  id        String     @id @default(cuid())
+  projectId String
+  project   Project    @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  name      String
+  status    TaskStatus @default(TODO)
+  createdAt DateTime   @default(now())
+
+  timeEntries TimeEntry[]
+
+  @@index([projectId])
+  @@map("tasks")
+}
+
+enum EstimateStatus {
+  DRAFT
+  SENT
+  APPROVED
+  REJECTED
+}
+
+model Estimate {
+  id          String         @id @default(cuid())
+  tenantId    String
+  tenant      Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  projectId   String
+  project     Project        @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  title       String
+  status      EstimateStatus @default(DRAFT)
+  currency    String         @default("USD")
+  totalMinor  Int            @default(0) // sum of line items, minor units
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+
+  lineItems EstimateLineItem[]
+
+  @@index([tenantId])
+  @@index([projectId])
+  @@map("estimates")
+}
+
+model EstimateLineItem {
+  id             String   @id @default(cuid())
+  estimateId     String
+  estimate       Estimate @relation(fields: [estimateId], references: [id], onDelete: Cascade)
+  description    String
+  quantity       Decimal  @db.Decimal(10, 2)
+  unitPriceMinor Int // minor units
+  amountMinor    Int // quantity * unitPriceMinor, stored for fast reads
+  sortOrder      Int      @default(0)
+
+  @@index([estimateId])
+  @@map("estimate_line_items")
+}
+
+enum ChangeRequestStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+model ChangeRequest {
+  id               String              @id @default(cuid())
+  projectId        String
+  project          Project             @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  title            String
+  description      String
+  status           ChangeRequestStatus @default(PENDING)
+  amountDeltaMinor Int                 @default(0) // +/- adjustment to project value
+  requestedById    String
+  requestedBy      User                @relation("ChangeRequestedBy", fields: [requestedById], references: [id])
+  createdAt        DateTime            @default(now())
+  decidedAt        DateTime?
+
+  @@index([projectId])
+  @@map("change_requests")
+}
+
+// ----------------------------------------------------------------------------
+// Time Tracking
+// ----------------------------------------------------------------------------
+
+model TimeEntry {
+  id          String   @id @default(cuid())
+  tenantId    String
+  tenant      Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  projectId   String
+  project     Project  @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  taskId      String?
+  task        Task?    @relation(fields: [taskId], references: [id])
+  userId      String
+  user        User     @relation(fields: [userId], references: [id])
+  date        DateTime @db.Date
+  minutes     Int // stored in minutes, not fractional hours, to avoid rounding issues
+  description String?
+  billable    Boolean  @default(true)
+  approved    Boolean  @default(false)
+  invoiced    Boolean  @default(false)
+  invoiceLineItemId String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([tenantId])
+  @@index([projectId])
+  @@index([userId])
+  @@map("time_entries")
+}
+
+// ----------------------------------------------------------------------------
+// Simple Accounting: Invoices + Expenses + (P&L is derived, not stored)
+// ----------------------------------------------------------------------------
+
+enum InvoiceStatus {
+  DRAFT
+  SENT
+  PAID
+  OVERDUE
+  VOID
+}
+
+model Invoice {
+  id          String        @id @default(cuid())
+  tenantId    String
+  tenant      Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  projectId   String?
+  project     Project?      @relation(fields: [projectId], references: [id])
+  clientId    String
+  client      Client        @relation(fields: [clientId], references: [id])
+  number      String // human-readable invoice number, e.g. INV-2026-0001
+  status      InvoiceStatus @default(DRAFT)
+  currency    String        @default("USD")
+  issueDate   DateTime      @db.Date
+  dueDate     DateTime      @db.Date
+  totalMinor  Int           @default(0)
+  paidMinor   Int           @default(0)
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  lineItems InvoiceLineItem[]
+
+  @@unique([tenantId, number])
+  @@index([tenantId])
+  @@index([clientId])
+  @@map("invoices")
+}
+
+model InvoiceLineItem {
+  id             String  @id @default(cuid())
+  invoiceId      String
+  invoice        Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  description    String
+  quantity       Decimal @db.Decimal(10, 2)
+  unitPriceMinor Int
+  amountMinor    Int
+  sortOrder      Int     @default(0)
+
+  @@index([invoiceId])
+  @@map("invoice_line_items")
+}
+
+model ExpenseCategory {
+  id       String @id @default(cuid())
+  tenantId String
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  name     String
+
+  expenses Expense[]
+
+  @@unique([tenantId, name])
+  @@map("expense_categories")
+}
+
+model Expense {
+  id          String          @id @default(cuid())
+  tenantId    String
+  tenant      Tenant          @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  projectId   String?
+  project     Project?        @relation(fields: [projectId], references: [id])
+  userId      String
+  user        User            @relation(fields: [userId], references: [id])
+  categoryId  String?
+  category    ExpenseCategory? @relation(fields: [categoryId], references: [id])
+  amountMinor Int
+  currency    String          @default("USD")
+  date        DateTime        @db.Date
+  description String?
+  billable    Boolean         @default(false)
+  reimbursed  Boolean         @default(false)
+  createdAt   DateTime        @default(now())
+
+  @@index([tenantId])
+  @@index([projectId])
+  @@map("expenses")
+}
