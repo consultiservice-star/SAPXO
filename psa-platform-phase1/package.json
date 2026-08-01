@@ -46,7 +46,8 @@
     "autoprefixer": "^10.4.20"
  },
   "engines": {
-    "node": ">=18.18.0"
+  "node": ">=20.9.0"
+}
   },
   "overrides": {
   "postcss": "^8.5.18",
